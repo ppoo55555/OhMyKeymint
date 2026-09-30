@@ -10,7 +10,6 @@ pub fn android_major_version() -> Option<i32> {
 }
 
 pub fn android_major_version_with(read_property: impl Fn(&str) -> Option<String>) -> Option<i32> {
-    // 先读系统真实的底层 SDK 版本（你的手机是 33，精确对应 Android 13）
     read_property("ro.build.version.sdk")
         .and_then(|sdk| sdk.parse::<i32>().ok())
         .map(|sdk| match sdk {
