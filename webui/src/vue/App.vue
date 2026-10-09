@@ -13,7 +13,12 @@ import {
 import { All, Settings, Tune } from 'miuix-vue/icons'
 import { AppList, type AppListSnapshot } from '../app_list/app_list'
 import { appearance } from '../appearance'
-import { Cli, type ActivityEntry, type KeyboxRevocationStatus } from '../cli'
+import {
+  Cli,
+  type DiagnosticsState,
+  type KeyboxInspector,
+  type KeyboxRevocationStatus,
+} from '../cli'
 import { ConfigOhMyKeyMint } from '../config_ohmykeymint'
 import { FileSelector } from '../file_selector/file_selector'
 import { History } from '../history'
@@ -23,6 +28,7 @@ import { isDev } from '../utils/dev'
 import HomeView, { type KeyboxStatus, type ModuleStatus, type TeeStatus } from './HomeView.vue'
 import PifFingerprintDialog from './PifFingerprintDialog.vue'
 import SettingsView from './SettingsView.vue'
+import SoterDialog from './SoterDialog.vue'
 import SoterHalDialog from './SoterHalDialog.vue'
 import TargetsView from './TargetsView.vue'
 import ToolsView, { type ToolEvent } from './ToolsView.vue'
@@ -46,13 +52,14 @@ const keyboxStatus = ref<KeyboxStatus>('loading')
 const keyboxSource = ref<'google_hardware' | 'google_remote' | 'unknown'>('unknown')
 const keyboxLevel = ref<'tee' | 'strongbox' | 'unknown'>('unknown')
 const keyboxRevocation = ref<KeyboxRevocationStatus>('not_checked')
+const keyboxInspector = ref<KeyboxInspector | null>(null)
+const diagnostics = ref<DiagnosticsState | null>(null)
+const diagnosticsStatus = ref<'loading' | 'ready' | 'error'>('loading')
 const teeStatus = ref<TeeStatus>('loading')
 const securityPatch = ref<string | null>(null)
 const spoofedDevice = ref<string | null | undefined>(undefined)
-const activities = ref<ActivityEntry[]>([])
-const activityStatus = ref<'loading' | 'ready' | 'error'>('loading')
-const activityClearBusy = ref(false)
 const securityPatchBusy = ref<'sync' | 'restore' | null>(null)
+const soterOpen = ref(false)
 const soterHalOpen = ref(false)
 const pifOpen = ref(false)
 const keyboxOpen = ref(false)
@@ -61,6 +68,7 @@ const keyboxBusy = ref(false)
 const targetsView = ref<InstanceType<typeof TargetsView> | null>(null)
 const settingsView = ref<InstanceType<typeof SettingsView> | null>(null)
 const pifDialog = ref<InstanceType<typeof PifFingerprintDialog> | null>(null)
+const soterDialog = ref<InstanceType<typeof SoterDialog> | null>(null)
 const soterHalDialog = ref<InstanceType<typeof SoterHalDialog> | null>(null)
 
 const pageIds = ['home', 'tools', 'settings'] as const
@@ -85,9 +93,12 @@ let navigationPointerSlotWidth = 1
 let navigationWasDragged = false
 let navigationSuppressClick = false
 
-function liquidNavigationEnabled(): boolean {
+// KernelSU's floating bar keeps its drag/spring interaction independent from
+// the optional liquid-glass surface treatment.  The same gesture therefore
+// remains available when the bar is rendered as a regular floating surface.
+function floatingNavigationEnabled(): boolean {
   const root = document.documentElement
-  return root.dataset.floatingBottomBar === 'true' && root.dataset.liquidGlass === 'true'
+  return root.dataset.floatingBottomBar === 'true'
 }
 
 function clampNavigationIndex(index: number): number {
@@ -102,7 +113,7 @@ function navigationPosition(clientX: number): number {
 }
 
 function onNavigationPointerDown(event: PointerEvent): void {
-  if (!navigationElement || !liquidNavigationEnabled() || !event.isPrimary || event.button !== 0
+  if (!navigationElement || !floatingNavigationEnabled() || !event.isPrimary || event.button !== 0
       || navigationPointerId !== null) return
   const bounds = navigationElement.getBoundingClientRect()
   navigationPointerSlotWidth = Math.max(
@@ -271,6 +282,7 @@ function onTargetsOverlayClose(): void {
 }
 
 function handleEscape(): void {
+  if (soterOpen.value && soterDialog.value?.busy) return
   if (soterHalOpen.value && soterHalDialog.value?.busy) return
   if (targetsOpen.value && targetsView.value?.dismissOverlay()) return
   if (history.size > 0) history.back()
@@ -315,6 +327,25 @@ async function refreshIdentity(force = false): Promise<void> {
     keyboxSource.value = 'google_remote'
     keyboxLevel.value = 'tee'
     keyboxRevocation.value = 'not_listed'
+    keyboxInspector.value = {
+      valid: true,
+      bundled: false,
+      rsa: null,
+      ec: {
+        algorithm: 'EC',
+        chain_length: 3,
+        serials: ['01', '02', '03'],
+        leaf_subject: 'CN=Demo keybox',
+        leaf_issuer: 'CN=Demo issuer',
+        valid_from: '2026-01-01T00:00:00Z',
+        valid_until: '2036-01-01T00:00:00Z',
+        certificates: [
+          { serial: '01', subject: 'CN=Demo keybox', issuer: 'CN=Demo issuer', valid_from: '2026-01-01T00:00:00Z', valid_until: '2036-01-01T00:00:00Z' },
+          { serial: '02', subject: 'CN=Demo issuer', issuer: 'CN=Demo root', valid_from: '2025-01-01T00:00:00Z', valid_until: '2040-01-01T00:00:00Z' },
+          { serial: '03', subject: 'CN=Demo root', issuer: 'CN=Demo root', valid_from: '2024-01-01T00:00:00Z', valid_until: '2044-01-01T00:00:00Z' },
+        ],
+      },
+    }
     teeStatus.value = 'normal'
     securityPatch.value = '2026-08-01'
     spoofedDevice.value = 'Google Pixel 9 Pro'
@@ -351,19 +382,35 @@ async function refreshIdentity(force = false): Promise<void> {
   }
 }
 
-async function refreshActivity(): Promise<void> {
-  try {
-    activities.value = (await cli.getActivityLog()).slice().sort((left, right) => right.timestamp - left.timestamp)
-    activityStatus.value = 'ready'
-  } catch (error) {
-    if (isDev()) {
-      const now = Math.floor(Date.now() / 1000)
-      activities.value = [{ action: 'keybox_changed', detail: '', timestamp: now - 3600 }]
-      activityStatus.value = 'ready'
-    } else {
-      activityStatus.value = 'error'
-      console.error('Unable to load activity:', error)
+async function refreshDiagnostics(): Promise<void> {
+  diagnosticsStatus.value = 'loading'
+  if (isDev()) {
+    diagnostics.value = {
+      keymint: { status: 'running', pid: 1234 },
+      keystore2: { status: 'running', pid: 1240 },
+      injector: { status: 'running', pid: 1250 },
+      soter: { status: 'configured', pid: null },
+      tee: { status: 'available', version: 300, name: 'TEE KeyMint' },
+      strongbox: { status: 'unavailable', version: null, name: null },
+      rkp_tee: { status: 'available', pid: null },
+      rkp_strongbox: { status: 'unavailable', pid: null },
+      selinux: 'enforcing',
     }
+    diagnosticsStatus.value = 'ready'
+    return
+  }
+
+  const [inspector, state] = await Promise.allSettled([
+    cli.getKeyboxInspector(),
+    cli.getDiagnostics(),
+  ])
+  if (inspector.status === 'fulfilled') keyboxInspector.value = inspector.value
+  if (state.status === 'fulfilled') {
+    diagnostics.value = state.value
+    diagnosticsStatus.value = 'ready'
+  } else {
+    diagnosticsStatus.value = 'error'
+    console.error('Unable to load OMK service diagnostics:', state.reason)
   }
 }
 
@@ -388,7 +435,7 @@ async function installKeybox(): Promise<void> {
     notify(i18n.t('prompt_keybox_replaced'))
     keyboxOpen.value = false
     selectedKeybox.value = null
-    await Promise.all([refreshIdentity(true), refreshActivity()])
+    await Promise.all([refreshIdentity(true), refreshDiagnostics()])
   } catch (error) {
     notify(i18n.t('prompt_keybox_replace_error', error instanceof Error ? error.message : String(error)), true)
   } finally {
@@ -410,7 +457,6 @@ async function syncPatch(restore: boolean): Promise<void> {
       securityPatch.value = applied
       notify(i18n.t('prompt_security_patch_sync_complete', applied))
     }
-    await refreshActivity()
   } catch (error) {
     notify(error instanceof Error ? error.message : String(error), true)
   } finally {
@@ -424,22 +470,9 @@ function onTool(event: ToolEvent): void {
     case 'installKeybox': void chooseKeybox(); break
     case 'syncSecurityPatch': void syncPatch(false); break
     case 'restoreSecurityPatch': void syncPatch(true); break
+    case 'openSoterBeta': soterOpen.value = true; break
     case 'openSoterHal': soterHalOpen.value = true; break
     case 'spoofPif': pifOpen.value = true; break
-  }
-}
-
-async function clearActivities(): Promise<void> {
-  if (activityClearBusy.value) return
-  activityClearBusy.value = true
-  try {
-    if (!isDev()) await cli.clearActivityLog()
-    activities.value = []
-    notify(i18n.t('home_activity_cleared'))
-  } catch (error) {
-    notify(error instanceof Error ? error.message : String(error), true)
-  } finally {
-    activityClearBusy.value = false
   }
 }
 
@@ -476,7 +509,7 @@ onMounted(async () => {
       history.consume('file-selector')
     }
   })
-  await Promise.all([reloadApps(true), refreshIdentity(), refreshActivity()])
+  await Promise.all([reloadApps(true), refreshIdentity(), refreshDiagnostics()])
 })
 
 onBeforeUnmount(() => {
@@ -530,6 +563,23 @@ watch(pifOpen, open => {
     })
   } else if (!open && overlayHistory.delete('pif-fingerprint')) history.consume('pif-fingerprint')
 })
+function trackSoterOverlay(): void {
+  const key = 'soter-beta'
+  if (!soterOpen.value || overlayHistory.has(key)) return
+  overlayHistory.add(key)
+  history.push(key, () => {
+    overlayHistory.delete(key)
+    if (soterDialog.value?.requestClose() === false) {
+      // Re-arm after the current popstate handler finishes so a busy dialog
+      // does not lose its back entry or close the page beneath it.
+      void nextTick(trackSoterOverlay)
+    }
+  })
+}
+watch(soterOpen, open => {
+  if (open) trackSoterOverlay()
+  else if (overlayHistory.delete('soter-beta')) history.consume('soter-beta')
+})
 function trackSoterHalOverlay(): void {
   const key = 'soter-hal'
   if (!soterHalOpen.value || overlayHistory.has(key)) return
@@ -561,13 +611,13 @@ watch(keyboxOpen, open => {
           :keybox-source="keyboxSource"
           :keybox-level="keyboxLevel"
           :keybox-revocation="keyboxRevocation"
+          :keybox-inspector="keyboxInspector"
+          :diagnostics="diagnostics"
+          :diagnostics-status="diagnosticsStatus"
           :tee-status="teeStatus"
           :security-patch="securityPatch"
           :spoofed-device="spoofedDevice"
-          :activities="activities"
-          :activity-status="activityStatus"
-          :activity-clear-busy="activityClearBusy"
-          @clear-activities="clearActivities"
+          @refresh-diagnostics="refreshDiagnostics"
         />
       </Transition>
       <Transition name="page-switch">
@@ -578,6 +628,7 @@ watch(keyboxOpen, open => {
           @install-keybox="onTool('installKeybox')"
           @sync-security-patch="onTool('syncSecurityPatch')"
           @restore-security-patch="onTool('restoreSecurityPatch')"
+          @open-soter-beta="onTool('openSoterBeta')"
           @open-soter-hal="onTool('openSoterHal')"
           @spoof-pif="onTool('spoofPif')"
         />
@@ -613,6 +664,7 @@ watch(keyboxOpen, open => {
         v-if="targetsOpen"
         ref="targetsView"
         :app-list="appList"
+        :cli="cli"
         :loading="targetsLoading"
         :apply-enabled="snapshot.isWritable"
         @close="closeTargets"
@@ -651,8 +703,9 @@ watch(keyboxOpen, open => {
       v-model="pifOpen"
       :cli="cli"
       @notify="notify"
-      @changed="refreshIdentity(true); refreshActivity()"
+      @changed="refreshIdentity(true)"
     />
+    <SoterDialog ref="soterDialog" v-model="soterOpen" :cli="cli" @notify="notify" />
     <SoterHalDialog ref="soterHalDialog" v-model="soterHalOpen" :cli="cli" @notify="notify" />
     <MiuixSnackbarHost />
   </div>
